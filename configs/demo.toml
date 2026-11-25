@@ -1,0 +1,25 @@
+[runtime]
+backend = "process"
+worker_timeout_ms = 20000
+event_capacity = 1024
+
+[batching]
+max_slots = 8
+wait_ms = 12
+deadline_guard_ms = 4
+row_multiple = 4
+max_pending = 4096
+max_attempts = 2
+
+[memory]
+page_bytes = 4096
+workspace_alignment = 64
+slot_bytes = 48
+
+[[devices]]
+name = "cpu0"
+capacity_bytes = 10000
+
+[[devices]]
+name = "cpu1"
+capacity_bytes = 12000

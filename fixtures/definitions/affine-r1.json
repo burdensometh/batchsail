@@ -1,0 +1,11 @@
+{
+  "model": "affine",
+  "revision": "r1",
+  "operator": "affine",
+  "input": {"columns": 3, "max_rows": 128},
+  "output": {"columns": 2, "max_rows": 128},
+  "weight_pages": 1,
+  "taps": 1,
+  "coefficients": [2, -1, 0.5, 0, 3, 1],
+  "bias": [0.5, -2]
+}

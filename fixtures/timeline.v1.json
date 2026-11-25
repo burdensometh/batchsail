@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "name": "revision-roll",
+  "steps": [
+    {
+      "op": "submit",
+      "at_ms": 0,
+      "request": {
+        "tenant": "timeline",
+        "request_id": "old",
+        "model": "affine",
+        "input": {"dtype": "float32", "shape": [2, 3], "values": [1, 2, 3, -1, 0, 2]}
+      },
+      "expect": {
+        "status": "succeeded",
+        "revision": "r1",
+        "output": {"dtype": "float32", "shape": [2, 2], "values": [2, 7, -0.5, 0]}
+      }
+    },
+    {"op": "activate", "at_ms": 0, "key": {"model": "affine", "revision": "r2"}},
+    {
+      "op": "submit",
+      "at_ms": 0,
+      "request": {
+        "tenant": "timeline",
+        "request_id": "new",
+        "model": "affine",
+        "input": {"dtype": "float32", "shape": [2, 3], "values": [1, 2, 3, -1, 0, 2]}
+      },
+      "expect": {
+        "status": "succeeded",
+        "revision": "r2",
+        "output": {"dtype": "float32", "shape": [2, 2], "values": [8, -1.25, 7, 0.5]}
+      }
+    }
+  ]
+}

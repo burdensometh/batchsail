@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batchsail"
+version = "0.1.0"
+description = "Multi-model CPU inference with dynamic batching and versioned admission"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+batchsail = "batchsail.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+batchsail = ["py.typed"]

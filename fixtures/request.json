@@ -1,0 +1,7 @@
+{
+  "tenant": "sample",
+  "request_id": "first",
+  "model": "affine",
+  "input": {"dtype": "float32", "shape": [2, 3], "values": [1, 2, 3, -1, 0, 2]},
+  "deadline_ms": 5000
+}

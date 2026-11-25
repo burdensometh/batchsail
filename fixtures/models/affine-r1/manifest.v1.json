@@ -1,0 +1,1 @@
+{"input":{"columns":3,"max_rows":128},"model":"affine","operator":"affine","output":{"columns":2,"max_rows":128},"revision":"r1","taps":1,"version":1,"weight_file":"weights.v1.json","weight_pages":1,"weights_sha256":"a80054aa986933dc464361436ee8386efebc0b63c1abab5b09e18c95b7cb9c72"}
