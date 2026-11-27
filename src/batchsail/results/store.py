@@ -1,7 +1,7 @@
 """Transactional SQLite v1 storage for admissions and their observable results."""
 
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
@@ -29,11 +29,55 @@ CREATE TABLE receipts (
 """
 _COLUMNS = "fingerprint, envelope"
 _UPDATE = "UPDATE receipts SET status=?, envelope=? WHERE tenant=? AND request_id=? AND status='pending'"
+_BLOB_CHUNK_BYTES = 64 * 1024
+
+
+def _blob_chunks(blob: sqlite3.Blob, size: int = _BLOB_CHUNK_BYTES) -> Iterator[bytes]:
+    while chunk := blob.read(size):
+        yield chunk
+
+
+def _snapshot_rows(
+    connection: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+) -> Iterator[tuple[str, Iterator[bytes]]]:
+    """Yield each row's fingerprint and a bounded reader over its raw envelope.
+
+    The caller must exhaust a row's chunk reader before advancing. This generator
+    owns the open blob and closes it before opening the next row, when the stream
+    ends, or when the caller closes it early.
+    """
+    active: sqlite3.Blob | None = None
+    try:
+        for position, fingerprint in cursor:
+            if active is not None:
+                active.close()
+            active = connection.blobopen("receipts", "envelope", position, readonly=True)
+            yield fingerprint, _blob_chunks(active)
+    finally:
+        if active is not None:
+            with suppress(sqlite3.Error):
+                active.close()
+
+
+def _snapshot_stream(
+    connection: sqlite3.Connection,
+    cursor: sqlite3.Cursor,
+) -> Iterator[tuple[str, Iterator[bytes]]]:
+    try:
+        yield from _snapshot_rows(connection, cursor)
+    finally:
+        with suppress(sqlite3.Error):
+            if connection.in_transaction:
+                connection.rollback()
+        with suppress(sqlite3.Error):
+            connection.close()
 
 
 class ReceiptStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._path = path
         self._lock = RLock()
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         try:
@@ -201,6 +245,53 @@ class ReceiptStore:
         with self._lock:
             rows = self._db.execute(query + " ORDER BY position LIMIT ?", args).fetchall()
         return tuple((position, self._record((fingerprint, payload))) for position, fingerprint, payload in rows)
+
+    def export_snapshot(
+        self,
+        *,
+        tenant: str | None = None,
+    ) -> Iterator[tuple[str, Iterator[bytes]]]:
+        """Stream terminal receipts visible when the snapshot opens, without decoding.
+
+        The visible set is fixed when this method is called: rows that are still
+        pending, or that appear later, are left for a subsequent export. A read-only
+        WAL connection holds a single read transaction for the whole stream, so
+        ordinary settlement proceeds on the writer connection while the snapshot
+        remains consistent. Each envelope is streamed in bounded chunks and never
+        materialised whole.
+        """
+        if tenant is not None:
+            identifier(tenant, "tenant")
+        connection = self._snapshot_connection()
+        try:
+            connection.execute("BEGIN")
+            boundary = connection.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM receipts",
+            ).fetchone()[0]
+            query = (
+                "SELECT position, fingerprint FROM receipts"
+                " WHERE position <= ? AND status != 'pending'"
+            )
+            args: list[str | int] = [boundary]
+            if tenant is not None:
+                query += " AND tenant = ?"
+                args.append(tenant)
+            cursor = connection.execute(query + " ORDER BY position", args)
+        except BaseException:
+            connection.close()
+            raise
+        return _snapshot_stream(connection, cursor)
+
+    def _snapshot_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self._path.resolve().as_uri() + "?mode=ro",
+            uri=True,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA query_only = ON")
+        return connection
 
     def import_terminal(self, receipts: Iterable[Receipt]) -> int:
         with self._transaction():

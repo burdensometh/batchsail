@@ -1,10 +1,11 @@
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 
 from batchsail.clock import ManualClock
-from batchsail.codec import decode
+from batchsail.codec import decode, encode
 from batchsail.config import WorkspaceGuard
 from batchsail.errors import Conflict, ErrorCode, Invalid
 from batchsail.registry import ModelKey, ModelStore
@@ -14,6 +15,7 @@ from batchsail.results import ReceiptStore, ResultEnvelope, ResultStatus
 from batchsail.results.archive import export_archive, import_archive
 from batchsail.results.model import Receipt
 from batchsail.runtime import Runtime
+from batchsail.tensor import Tensor
 
 from support import MODELS, ROOT, config, install, request
 
@@ -99,6 +101,150 @@ class ReceiptV1Tests(unittest.TestCase):
                 with self.assertRaises(Conflict):
                     store.import_terminal((other, replace(existing, fingerprint="0" * 64)))
                 self.assertIsNone(store.find(other.result.key))
+            finally:
+                store.close()
+
+    def _succeeded(self, name, *, tenant="alpha", fingerprint="a" * 64):
+        key = RequestKey(tenant, name)
+        return Receipt(
+            fingerprint,
+            ResultEnvelope(
+                key, ModelKey("affine", "r1"), ResultStatus.SUCCEEDED, 1000,
+                attempt=1, batch_id="b", slot=0, device="cpu0", queue_ns=0, elapsed_ns=0,
+                output=Tensor((1, 2), (2.0, 7.0)),
+            ),
+        )
+
+    def test_export_snapshot_is_fixed_when_the_export_starts(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ReceiptStore(root / "results.sqlite")
+            try:
+                store.insert(self._succeeded("before"))
+                store.insert(Receipt(
+                    self._succeeded("pending").fingerprint,
+                    ResultEnvelope(
+                        RequestKey("alpha", "pending"), ModelKey("affine", "r1"),
+                        ResultStatus.PENDING, 1000,
+                    ),
+                ))
+                snapshot = store.export_snapshot()
+                # A row that becomes terminal and a brand-new row appear after the
+                # snapshot opened; neither belongs to this export.
+                store.settle(
+                    ResultEnvelope(
+                        RequestKey("alpha", "pending"), ModelKey("affine", "r1"),
+                        ResultStatus.SUCCEEDED, 1000, attempt=1, batch_id="b", slot=0,
+                        device="cpu0", queue_ns=0, elapsed_ns=0,
+                        output=Tensor((1, 2), (1.0, 1.0)),
+                    ),
+                    expected_attempt=1,
+                )
+                store.insert(self._succeeded("later"))
+                names = [decode(b"".join(chunks))["request_id"] for _, chunks in snapshot]
+                self.assertEqual(names, ["before"])
+            finally:
+                store.close()
+            count = export_archive(store, root / "next.jsonl")
+            self.assertEqual(count, 2)
+
+    def test_export_byte_roundtrip_matches_canonical_encoding(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ReceiptStore(root / "results.sqlite")
+            try:
+                receipt = self._succeeded("one")
+                store.insert(receipt)
+                path = root / "one.jsonl"
+                self.assertEqual(export_archive(store, path), 1)
+                self.assertEqual(path.read_bytes(), encode(receipt.to_v1()) + b"\n")
+            finally:
+                store.close()
+
+    def test_export_streams_large_tensors_within_bounded_memory(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ReceiptStore(root / "results.sqlite")
+            try:
+                values = Tensor((512, 512), tuple(0.0 for _ in range(512 * 512)))
+                for index in range(8):
+                    key = RequestKey("alpha", f"big{index}")
+                    store.insert(Receipt(
+                        f"{index:064x}",
+                        ResultEnvelope(
+                            key, ModelKey("affine", "r1"), ResultStatus.SUCCEEDED, 1000,
+                            attempt=1, batch_id="b", slot=0, device="cpu0", queue_ns=0,
+                            elapsed_ns=0, output=values,
+                        ),
+                    ))
+                path = root / "big.jsonl"
+                self.assertEqual(export_archive(store, path), 8)
+                self.assertEqual(import_archive(ReceiptStore(root / "replica.sqlite"), path), 8)
+            finally:
+                store.close()
+
+    def test_export_write_failure_keeps_previous_archive(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ReceiptStore(root / "results.sqlite")
+            try:
+                store.insert(self._succeeded("one"))
+                target = root / "archive.jsonl"
+                self.assertEqual(export_archive(store, target), 1)
+                original = target.read_bytes()
+
+                def broken(chunks):
+                    yield from chunks
+                    raise OSError("disk full")
+
+                original_snapshot = store.export_snapshot
+
+                def failing_snapshot(*, tenant=None):
+                    for fingerprint, chunks in original_snapshot(tenant=tenant):
+                        yield fingerprint, broken(chunks)
+
+                store.export_snapshot = failing_snapshot
+                with self.assertRaises(OSError):
+                    export_archive(store, target)
+                store.export_snapshot = original_snapshot
+                self.assertEqual(target.read_bytes(), original)
+                leftovers = [p.name for p in root.iterdir() if p.name.startswith(f".{target.name}.")]
+                self.assertEqual(leftovers, [])
+            finally:
+                store.close()
+
+    def test_export_does_not_block_settlement_until_it_finishes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ReceiptStore(root / "results.sqlite")
+            try:
+                store.insert(Receipt(
+                    self._succeeded("running").fingerprint,
+                    ResultEnvelope(
+                        RequestKey("alpha", "running"), ModelKey("affine", "r1"),
+                        ResultStatus.PENDING, 1000,
+                    ),
+                ))
+                settled = threading.Event()
+
+                def settle():
+                    store.settle(
+                        ResultEnvelope(
+                            RequestKey("alpha", "running"), ModelKey("affine", "r1"),
+                            ResultStatus.SUCCEEDED, 1000, attempt=1, batch_id="b", slot=0,
+                            device="cpu0", queue_ns=0, elapsed_ns=0,
+                            output=Tensor((1, 2), (3.0, 4.0)),
+                        ),
+                        expected_attempt=1,
+                    )
+                    settled.set()
+
+                snapshot = store.export_snapshot()
+                worker = threading.Thread(target=settle)
+                worker.start()
+                self.assertTrue(settled.wait(2), "settlement blocked behind the export snapshot")
+                worker.join()
+                self.assertEqual(list(snapshot), [])
             finally:
                 store.close()
 
