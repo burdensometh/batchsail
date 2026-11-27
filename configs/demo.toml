@@ -10,6 +10,7 @@ deadline_guard_ms = 4
 row_multiple = 4
 max_pending = 4096
 max_attempts = 2
+urgent_priority = false
 
 [memory]
 page_bytes = 4096

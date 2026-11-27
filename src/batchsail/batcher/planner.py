@@ -8,7 +8,7 @@ from ..device.types import DeviceRejection, MemoryDemand
 from ..registry.model import ModelKey
 from ..request.lifecycle import Ticket
 from .batch import ShapeKey
-from .queue import BatchQueues, ShapeQueue
+from .queue import BatchQueues, BatchingPolicy, ShapeQueue
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,8 +69,12 @@ class BatchPlanner:
             elif next_ns is None or time_ns < next_ns:
                 next_ns = time_ns
 
+        ordered = sorted(ready)
+        if policy.urgent_priority:
+            ordered = self._urgent_first(ordered, now_ns, policy)
+
         blocked: list[SchedulingBlock] = []
-        for _, _, shape, maximum, group in sorted(ready):
+        for _, _, shape, maximum, group in ordered:
             tickets = group.choose(maximum, now_ns + policy.deadline_guard_ms * NS_PER_MS)
             for size in range(len(tickets), 0, -1):
                 candidates = self.ledger.assess(self._demand(group, size), protected)
@@ -82,3 +86,29 @@ class BatchPlanner:
                 tuple(candidate for candidate in candidates if isinstance(candidate, DeviceRejection)),
             ))
         return None, next_ns, tuple(blocked)
+
+    def _urgent_first(
+        self,
+        ordered: list[tuple[int, int, ShapeKey, int, ShapeQueue]],
+        now_ns: int,
+        policy: BatchingPolicy,
+    ) -> list[tuple[int, int, ShapeKey, int, ShapeQueue]]:
+        """Float groups inside the deadline guard ahead of earlier-queued work.
+
+        An urgent group is one whose nearest request deadline is within the
+        dispatch guard. Those groups are tried by earliest deadline first, ahead
+        of the usual readiness/age order. Groups that are already full but not
+        urgent keep their original relative order behind the urgent candidates.
+        """
+        guard_ns = policy.deadline_guard_ms * NS_PER_MS
+        horizon_ns = now_ns + guard_ns
+        urgent: list[tuple[int, tuple[int, int, ShapeKey, int, ShapeQueue]]] = []
+        normal: list[tuple[int, int, ShapeKey, int, ShapeQueue]] = []
+        for entry in ordered:
+            deadline_ns = entry[4].earliest_deadline_ns
+            if deadline_ns is not None and deadline_ns <= horizon_ns:
+                urgent.append((deadline_ns, entry))
+            else:
+                normal.append(entry)
+        urgent.sort(key=lambda item: (item[0],) + item[1][:3])
+        return [entry for _, entry in urgent] + normal

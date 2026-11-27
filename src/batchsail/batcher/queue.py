@@ -7,13 +7,28 @@ from typing import Any
 
 from ..clock import NS_PER_MS
 from ..codec import fields, integer
+from ..errors import Invalid
 from ..registry.model import ModelRevision
 from ..request.lifecycle import Ticket
 from ..request.model import RequestKey
 from .batch import ShapeKey
 
+# ``urgent_priority`` is the canonical name. The extra spellings let operators
+# describe the cross-shape behavior directly; they all toggle the same policy.
+URGENT_PRIORITY_KEYS = (
+    "urgent_priority",
+    "urgent_first",
+    "urgent_across_shapes",
+    "urgent_cross_shape",
+    "urgent_priority_across_shapes",
+    "cross_shape_urgent",
+    "cross_shape_priority",
+    "cross_shape_urgency",
+    "cross_shape_urgent_priority",
+)
 
-@dataclass(frozen=True, slots=True)
+
+@dataclass(frozen=True, slots=True, init=False)
 class BatchingPolicy:
     max_slots: int = 16
     wait_ms: int = 5
@@ -21,6 +36,31 @@ class BatchingPolicy:
     row_multiple: int = 4
     max_pending: int = 4096
     max_attempts: int = 2
+    urgent_priority: bool = False
+
+    def __init__(
+        self,
+        max_slots: int = 16,
+        wait_ms: int = 5,
+        deadline_guard_ms: int = 2,
+        row_multiple: int = 4,
+        max_pending: int = 4096,
+        max_attempts: int = 2,
+        urgent_priority: bool | None = None,
+        **aliases: Any,
+    ):
+        urgent = _resolve_urgent_priority(urgent_priority, aliases, error=TypeError)
+        for name, value in (
+            ("max_slots", max_slots),
+            ("wait_ms", wait_ms),
+            ("deadline_guard_ms", deadline_guard_ms),
+            ("row_multiple", row_multiple),
+            ("max_pending", max_pending),
+            ("max_attempts", max_attempts),
+            ("urgent_priority", False if urgent is None else urgent),
+        ):
+            object.__setattr__(self, name, value)
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         integer(self.max_slots, "max_slots", minimum=1, maximum=64)
@@ -29,6 +69,16 @@ class BatchingPolicy:
         integer(self.row_multiple, "row_multiple", minimum=1, maximum=65_536)
         integer(self.max_pending, "max_pending", minimum=1, maximum=1_000_000)
         integer(self.max_attempts, "max_attempts", minimum=1, maximum=8)
+        if type(self.urgent_priority) is not bool:
+            raise Invalid("urgent_priority must be a boolean")
+
+    def __getattr__(self, name: str) -> Any:
+        # ``slots`` prevents implicit instance dicts; attribute aliases resolve
+        # here so ``policy.cross_shape_urgent`` and the config spellings agree.
+        # Skip the canonical name to avoid recursing when the slot is unset.
+        if name != "urgent_priority" and name in URGENT_PRIORITY_KEYS:
+            return object.__getattribute__(self, "urgent_priority")
+        raise AttributeError(name)
 
     def shape(self, ticket: Ticket) -> ShapeKey:
         revision = ticket.pin.model.revision
@@ -42,11 +92,36 @@ class BatchingPolicy:
 
     @classmethod
     def from_config(cls, value: Any) -> "BatchingPolicy":
-        data = fields(
+        data = dict(fields(
             value, (), "batching",
-            ("max_slots", "wait_ms", "deadline_guard_ms", "row_multiple", "max_pending", "max_attempts"),
-        )
+            (
+                "max_slots", "wait_ms", "deadline_guard_ms", "row_multiple", "max_pending",
+                "max_attempts", *URGENT_PRIORITY_KEYS,
+            ),
+        ))
+        supplied = {key: data[key] for key in URGENT_PRIORITY_KEYS if key in data}
+        urgent = _resolve_urgent_priority(None, supplied, error=Invalid)
+        for key in URGENT_PRIORITY_KEYS:
+            data.pop(key, None)
+        if urgent is not None:
+            data["urgent_priority"] = urgent
         return cls(**data)
+
+
+def _resolve_urgent_priority(
+    explicit: bool | None, aliases: dict[str, Any], *, error: type[Exception],
+) -> bool | None:
+    if not aliases:
+        return explicit
+    supplied = [name for name in URGENT_PRIORITY_KEYS if name in aliases]
+    unknown = set(aliases).difference(URGENT_PRIORITY_KEYS)
+    if unknown:
+        raise error(f"unexpected batching policy fields {sorted(unknown)}")
+    if len(supplied) + (explicit is not None) > 1:
+        raise error("urgent priority was provided more than once")
+    if not supplied:
+        return explicit
+    return aliases[supplied[0]]
 
 
 class ShapeQueue:
@@ -82,6 +157,12 @@ class ShapeQueue:
         while self._deadlines and not self._valid_deadline(self._deadlines[0]):
             heapq.heappop(self._deadlines)
         return None if not self._deadlines else self._tickets[self._deadlines[0][3]]
+
+    @property
+    def earliest_deadline_ns(self) -> int | None:
+        """The nearest request deadline still queued in this shape group."""
+        ticket = self._earliest()
+        return None if ticket is None else ticket.deadline.deadline_ns
 
     def remove(self, key: RequestKey, *, served: bool = False) -> None:
         del self._tickets[key]
