@@ -20,7 +20,7 @@ from .errors import Conflict, ErrorCode, Invalid, SailError
 from .executor import Backend, BatchExecution, Boundary, BoundaryEvent, Hook, InlineBackend, ProcessBackend, Supervisor
 from .executor.faults import no_hook
 from .registry import Catalog, ModelKey, ModelStore
-from .registry.catalog import RevisionPin, RevisionView
+from .registry.catalog import CatalogSwitch, RevisionPin, RevisionView
 from .registry.model import ModelRevision
 from .request import Admission, Request, RequestDeadline, RequestKey
 from .request.lifecycle import DeadlineIndex, Ticket
@@ -223,6 +223,53 @@ class Runtime:
                 self._note("model_activated", **key.to_json(), generation=after)
                 self._condition.notify_all()
             return after
+
+    def switch_many(
+        self,
+        targets: tuple[ModelKey, ...],
+        *,
+        expected_generation: int | None = None,
+    ) -> CatalogSwitch:
+        """Atomically switch several models after validating every target.
+
+        Each target revision must be installed and runnable for one slot on the
+        configured devices. Any failure happens before catalog state changes, so a
+        rejected switch preserves every active revision, its pins and the generation.
+        A successful switch commits the whole target set in one catalog write and
+        advances the generation by at most one.
+        """
+        if expected_generation is not None:
+            integer(expected_generation, "expected catalog generation")
+        names = [key.name for key in targets]
+        if not names:
+            raise Invalid("a catalog switch requires at least one target revision")
+        if len(set(names)) != len(names):
+            raise Invalid("a catalog switch can name each model at most once")
+        with self._condition:
+            self._require_admission()
+            revisions = tuple(self._catalog.get(key).revision for key in targets)
+            # Verify device runnability for the complete target set before any
+            # catalog write, so one unrunnable revision aborts the whole switch.
+            for revision in revisions:
+                self._validate_fits(revision, 1)
+            before_generation, before_views = self._catalog.snapshot()
+            before_active = {
+                view.model.key.name: view.model.key for view in before_views if view.active
+            }
+            result = self._catalog.switch_many(
+                targets, expected_generation=expected_generation
+            )
+            if before_generation != result.generation:
+                changed = [
+                    key.to_json() for key in targets
+                    if result.active.get(key.name) == key and before_active.get(key.name) != key
+                ]
+                self._note(
+                    "catalog_switched", generation=result.generation,
+                    targets=[key.to_json() for key in targets], changed=changed,
+                )
+                self._condition.notify_all()
+            return result
 
     def _validate_fits(self, revision: ModelRevision, rows: int) -> None:
         padded = self.config.batching.padded_rows(rows, revision.input_spec.max_rows)

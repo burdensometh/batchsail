@@ -58,6 +58,19 @@ def _activate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _switch(args: argparse.Namespace) -> int:
+    if len(args.target) % 2:
+        raise Invalid("switch targets must be given as model/revision pairs")
+    targets = tuple(
+        ModelKey(args.target[index], args.target[index + 1])
+        for index in range(0, len(args.target), 2)
+    )
+    with _runtime(args) as runtime:
+        result = runtime.switch_many(targets, expected_generation=args.expected_generation)
+        _display(result.to_json())
+    return 0
+
+
 def _pack(args: argparse.Namespace) -> int:
     _display(pack_definition(args.definition, args.bundle).to_v1())
     return 0
@@ -143,6 +156,15 @@ def _parser() -> argparse.ArgumentParser:
     activate.add_argument("model")
     activate.add_argument("revision")
     activate.add_argument("--expected-generation", type=int)
+
+    switch = _runtime_flags(_set_action(
+        sub.add_parser("switch", help="atomically switch one or more model revisions"), _switch,
+    ))
+    switch.add_argument(
+        "target", nargs="+", metavar="model revision",
+        help="alternating model and revision identifiers, e.g. affine r2 filter r1",
+    )
+    switch.add_argument("--expected-generation", type=int)
 
     infer = _runtime_flags(_set_action(sub.add_parser("infer", help="submit one request from JSON"), _infer))
     infer.add_argument("input", type=Path)

@@ -45,10 +45,13 @@ The HTTP listener defaults to loopback. It is intended for trusted clients and o
 | GET | `/v1/events?after=0&limit=100` | Bounded event stream with cursor and dropped range. |
 | POST | `/v1/catalog/install` | Install the named immediate child of `--bundle-root`. Body contains `bundle`. |
 | POST | `/v1/catalog/activate` | Activate a `model` and `revision`. Optional `expected_generation` provides compare-and-swap. |
+| POST | `/v1/catalog/switch` | Atomically switch several revisions. Body contains an `activations` array of model/revision objects and an optional `expected_generation`. |
 | POST | `/v1/devices/estimate` | Preview capacity for `model` and `rows`. Optional `slots` and `revision`. |
 | POST | `/v1/devices/trim` | Release idle retired weights. Accepts a `device` and a `revision` model key as optional filters. |
 
 For example, send `{"bundle":"affine-r2"}` to install the second revision, then `{"model":"affine","revision":"r2","expected_generation":1}` to activate it.
+
+A release can move several models at once through `POST /v1/catalog/switch` with `{"activations":[{"model":"affine","revision":"r2"},{"model":"filter","revision":"r1"}],"expected_generation":2}`. Every target revision must be installed and runnable for one slot on the configured devices; verification of the complete set finishes before any catalog write, so one unqualified target rejects the whole request and leaves every active revision, its pins and the generation untouched. A committed switch replaces the directory in a single catalog write and advances the generation by exactly one regardless of how many models changed (a no-op switch keeps the generation stable). `expected_generation` provides the same compare-and-swap as activation, so racing switches serialize: the loser gets `409 conflict` and changes nothing. Admissions are pinned to either the pre-switch or post-switch directory view; requests accepted before the switch keep their original revision until they settle, while new admissions use the new active revisions. The CLI mirrors this with `batchsail switch --workspace var/service affine r2 filter r1 --expected-generation 2`.
 
 `batchsail replay fixtures/timeline.v1.json --url http://127.0.0.1:8080` plays the submitted operations against a running service and compares terminal results to the timeline. Start with both affine bundles installed, r1 active, and fresh request IDs. `python examples/http_replay.py` provisions these conditions in a temporary workspace. On SIGTERM and SIGINT, the service stops taking new connections and waits up to `--shutdown-grace-ms` for admitted work to complete.
 

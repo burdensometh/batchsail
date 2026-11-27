@@ -3,10 +3,23 @@
 from collections import Counter
 from dataclasses import dataclass
 from threading import RLock
+from typing import Any
 
 from ..errors import Conflict, ErrorCode, Invalid, SailError
 from .model import InstalledModel, ModelKey, ModelRevision
 from .store import ModelStore
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogSwitch:
+    generation: int
+    active: dict[str, ModelKey]
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "generation": self.generation,
+            "active": {name: key.to_json() for name, key in sorted(self.active.items())},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +78,41 @@ class Catalog:
             self._active = updated
             self._generation = generation
             return generation
+
+    def switch_many(
+        self,
+        targets: tuple[ModelKey, ...],
+        *,
+        expected_generation: int | None = None,
+    ) -> CatalogSwitch:
+        """Atomically move every named model to its target revision in one generation.
+
+        Verification of every target and the expected generation completes before any
+        catalog state is touched, so a failed switch leaves all active revisions and
+        the generation untouched. A successful switch advances the generation by at
+        most one even when several models change.
+        """
+        if not targets:
+            raise Invalid("a catalog switch requires at least one target revision")
+        names = [key.name for key in targets]
+        if len(set(names)) != len(names):
+            raise Invalid("a catalog switch can name each model at most once")
+        with self._lock:
+            if expected_generation is not None and self._generation != expected_generation:
+                raise Conflict(
+                    f"catalog generation is {self._generation}, expected {expected_generation}"
+                )
+            updated = dict(self._active)
+            for key in targets:
+                self.get(key)
+                updated[key.name] = key
+            if updated == self._active:
+                return CatalogSwitch(self._generation, dict(self._active))
+            generation = self._generation + 1
+            self._store.write_catalog(generation, updated)
+            self._active = updated
+            self._generation = generation
+            return CatalogSwitch(generation, dict(updated))
 
     def active(self, name: str) -> InstalledModel:
         with self._lock:

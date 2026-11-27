@@ -203,6 +203,8 @@ class SailHandler(BaseHTTPRequestHandler):
             _options(target.query, set())
             if segments == ("v1", "catalog", "activate"):
                 return self._activate()
+            if segments == ("v1", "catalog", "switch"):
+                return self._switch()
             if segments == ("v1", "catalog", "install"):
                 return self._install()
         if segments == ("v1", "devices", "trim") and self.command == "POST":
@@ -249,6 +251,19 @@ class SailHandler(BaseHTTPRequestHandler):
         key = ModelKey(body["model"], body["revision"])
         generation = self.server.runtime.activate(key, expected_generation=body.get("expected_generation"))
         return Reply(HTTPStatus.OK, {**key.to_json(), "generation": generation})
+
+    def _switch(self) -> Reply:
+        body = fields(
+            self._body(), ("activations",), "catalog switch", ("expected_generation",)
+        )
+        raw_targets = body["activations"]
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise Invalid("catalog switch activations must be a non-empty array")
+        targets = tuple(ModelKey.from_json(entry) for entry in raw_targets)
+        result = self.server.runtime.switch_many(
+            targets, expected_generation=body.get("expected_generation")
+        )
+        return Reply(HTTPStatus.OK, result.to_json())
 
     def _install(self) -> Reply:
         root = self.server.bundle_root

@@ -206,6 +206,29 @@ class HttpClient:
             raise TransportFailure("server activation refers to a different revision")
         return integer(obj["generation"], "catalog generation")
 
+    def switch_many(
+        self,
+        targets: tuple[ModelKey, ...],
+        *,
+        expected_generation: int | None = None,
+    ) -> tuple[int, dict[str, ModelKey]]:
+        if not targets:
+            raise Invalid("a catalog switch requires at least one target revision")
+        body: dict[str, Any] = {"activations": [key.to_json() for key in targets]}
+        if expected_generation is not None:
+            body["expected_generation"] = integer(expected_generation, "catalog generation")
+        _, payload = self._send("POST", "/v1/catalog/switch", (200,), body=body)
+        obj = fields(payload, ("generation", "active"), "catalog switch")
+        generation = integer(obj["generation"], "catalog generation")
+        active = obj["active"]
+        if not isinstance(active, dict):
+            raise TransportFailure("server switch response must map model names to revisions")
+        resolved = {name: ModelKey.from_json(entry) for name, entry in active.items()}
+        for key in targets:
+            if resolved.get(key.name) != key:
+                raise TransportFailure("server switch result does not include every requested revision")
+        return generation, resolved
+
     def history(
         self, *, after: int = 0, limit: int = 100, tenant: str | None = None, status: ResultStatus | None = None,
     ) -> tuple[tuple[ResultEnvelope, ...], int]:
