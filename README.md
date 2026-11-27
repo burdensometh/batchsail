@@ -35,12 +35,24 @@ The HTTP listener defaults to loopback. It is intended for trusted clients and o
 - A caller can explicitly retry a retryable receipt with a new request ID and the `retry_of` field. This is a fresh admission to the current revision of the same model.
 - CPU execution supports an inline mode for controlled interleavings and spawned processes for isolated execution. A device backend implements `executor.Backend`; its buffers must obey the lease and slot contracts. A GPU backend would implement weight residency, transfer, execution, synchronization and device reset behind that interface.
 
+### Resumable terminal stream
+
+`GET /v1/terminal-results` is the durable subscription entry for callers that only care about outcomes, not the volatile scheduling events in `/v1/events`.
+
+- Each terminal settlement is assigned one gap-free `terminal_position` in the server's settlement order, inside the same SQLite transaction that persists the terminal envelope. The position lives in the `terminal_log` table, not the bounded in-memory event ring, so an overwritten event buffer or a process restart never loses a record.
+- Every terminal kind is visible: `succeeded`, `cancelled`, `expired`, and `failed` — including worker failures and the `interrupted` failures produced when pending receipts are recovered after a restart. A given request occupies exactly one position for its whole lifetime; re-reading, cancelling, or re-submitting an already terminal result never adds another.
+- A client reads strictly after a cursor (`after`) and pages with `limit` (1–1000). Each entry echoes its `terminal_position`; the response also carries `next` (resume cursor) and `latest` (newest durable position). Disconnect and reconnect with the last seen position to catch up without gaps or duplicates.
+- When no new terminal result exists, `wait_ms` (0–10000, default 0) bounds a long poll. Waiting readers block on the coordinator condition variable and are woken by the next settlement; they never hold the coordinator lock, so a slow or disconnected reader cannot delay new settlements. An idle wait returns an empty page with unchanged cursors rather than hanging.
+- Databases written by schema version one are upgraded transparently: pre-existing terminal receipts are backfilled into `terminal_log` in admission order, and any still-pending rows are recovered to `interrupted` and appended on the first open. `batchsail inspect` verifies the log is gap-free, matches the terminal receipts one-to-one, and references no pending or missing row.
+
+
 | Method | Path | Behavior |
 | --- | --- | --- |
 | POST | `/v1/requests` | Admit a JSON request and return its location. 202 for new work, 200 for repeat. |
 | GET | `/v1/requests/{tenant}/{id}?wait_ms=1000` | Read the result, optionally long poll up to 10 seconds. 202 pending or 200 terminal. |
 | DELETE | `/v1/requests/{tenant}/{id}` | Cancel pending work or return the existing terminal result. |
 | GET | `/v1/requests?tenant=sample&after=0&limit=10` | Cursor-paginated receipt history. Optional status filter. |
+| GET | `/v1/terminal-results?after=0&limit=100&wait_ms=1000` | Durable, resumable stream of terminal results only. Bounded long poll. |
 | GET | `/v1/status` | Catalog generation, revision pins, allocator state, scheduling blocks, and latency histograms. |
 | GET | `/v1/events?after=0&limit=100` | Bounded event stream with cursor and dropped range. |
 | POST | `/v1/catalog/install` | Install the named immediate child of `--bundle-root`. Body contains `bundle`. |
@@ -56,7 +68,7 @@ For example, send `{"bundle":"affine-r2"}` to install the second revision, then 
 
 - A bundle contains `manifest.v1.json` and `weights.v1.json`. The manifest names a float32 input/output width, maximum rows, an operator, tap count, resident pages, and the SHA-256 of the exact weight file. Coefficients are output-channel-major for affine and tap-then-output-channel-major for the causal filter. Within a channel they follow input-column order.
 - `batchsail pack fixtures/definitions/affine-r1.json /tmp/affine-r1` writes a bundle. `batchsail validate /tmp/affine-r1` verifies it. Installation copies checked weights and materializes a canonical manifest. `catalog.v1.json` persists active revisions and catalog generation.
-- `receipts.sqlite` uses SQLite user version 1. For transfer, use `batchsail receipts --workspace var/archive import fixtures/receipts.v1.jsonl` and `batchsail receipts --workspace var/archive export /tmp/receipts.v1.jsonl`. Each line encodes a version, a canonical request fingerprint, and a checked terminal envelope. Import is atomic and idempotent for byte-equivalent receipt content.
+- `receipts.sqlite` uses SQLite user version 2. Version two adds the `terminal_log` table that backs `/v1/terminal-results`; a version-one database is migrated in place on first open. For transfer, use `batchsail receipts --workspace var/archive import fixtures/receipts.v1.jsonl` and `batchsail receipts --workspace var/archive export /tmp/receipts.v1.jsonl`. Each line encodes a version, a canonical request fingerprint, and a checked terminal envelope. Import is atomic and idempotent for byte-equivalent receipt content.
 - `configs/demo.toml` shows both logical devices, page units, workspace alignment, batch limits, and worker settings. A model identity is immutable inside one workspace. `workspace.v1.json` records its page size. `batchsail inspect --workspace var/service --config configs/demo.toml` checks the catalog, bundle contents, capacity fit and receipt consistency while the service is offline.
 
 ## Verification

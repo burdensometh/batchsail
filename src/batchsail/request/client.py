@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from time import monotonic, sleep
 from typing import Any
+from collections.abc import Iterator
 from urllib.parse import urlencode, urlsplit
 
 from ..codec import decode, encode, fields, identifier, integer
@@ -226,3 +227,59 @@ class HttpClient:
         if bool(receipts) != (marker > after):
             raise TransportFailure("server did not advance the history cursor consistently")
         return receipts, marker
+
+    def terminal_page(
+        self, *, after: int = 0, limit: int = 100, wait_ms: int = 0,
+    ) -> tuple[tuple[tuple[int, ResultEnvelope], ...], int, int]:
+        """Fetch one durable terminal-stream page after cursor ``after``.
+
+        Returns ``(entries, next, latest)`` where each entry is
+        ``(terminal_position, envelope)``. A positive ``wait_ms`` long-polls for
+        new terminal results, bounded by the server's ten-second wait ceiling.
+        """
+        query = {
+            "after": integer(after, "after cursor"),
+            "limit": integer(limit, "terminal limit", minimum=1, maximum=1000),
+            "wait_ms": integer(wait_ms, "wait_ms", maximum=MAX_LONG_POLL_MS),
+        }
+        _, payload = self._send(
+            "GET", "/v1/terminal-results?" + urlencode(query), (200,), replayable=True,
+        )
+        page = fields(payload, ("results", "next", "latest"), "terminal stream page")
+        if not isinstance(page["results"], list) or len(page["results"]) > limit:
+            raise TransportFailure("server returned an invalid terminal stream page")
+        entries: list[tuple[int, ResultEnvelope]] = []
+        previous = after
+        for item in page["results"]:
+            position = integer(item["terminal_position"], "terminal_position", minimum=after + 1)
+            if position <= previous:
+                raise TransportFailure("terminal stream positions must be strictly increasing")
+            envelope = ResultEnvelope.from_json(
+                {key: value for key, value in item.items() if key != "terminal_position"},
+            )
+            if not envelope.status.terminal:
+                raise TransportFailure("terminal stream entry is not terminal")
+            entries.append((position, envelope))
+            previous = position
+        marker = integer(page["next"], "terminal next cursor", minimum=after)
+        latest = integer(page["latest"], "terminal latest cursor")
+        if latest < marker or bool(entries) != (marker > after):
+            raise TransportFailure("server did not advance the terminal cursor consistently")
+        return tuple(entries), marker, latest
+
+    def terminal_follow(
+        self, *, after: int = 0, limit: int = 100, wait_ms: int = MAX_LONG_POLL_MS,
+    ) -> Iterator[tuple[int, ResultEnvelope]]:
+        """Yield terminal results in durable order, resuming from ``after``.
+
+        The generator keeps the server-side cursor itself, so a transport retry
+        or a fresh ``terminal_follow`` with the last yielded position never
+        duplicates or skips a terminal result.
+        """
+        cursor = after
+        while True:
+            entries, cursor, _latest = self.terminal_page(after=cursor, limit=limit, wait_ms=wait_ms)
+            if not entries:
+                return
+            for entry in entries:
+                yield entry

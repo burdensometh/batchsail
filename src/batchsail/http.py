@@ -189,6 +189,8 @@ class SailHandler(BaseHTTPRequestHandler):
             if segments == ("v1", "events"):
                 options = _options(target.query, {"after", "limit"})
                 return Reply(HTTPStatus.OK, runtime.events(**_pagination(options)))
+            if segments == ("v1", "terminal-results"):
+                return self._terminal_stream(target.query)
             if segments == ("v1", "requests"):
                 return self._history(target.query)
         if segments == ("v1", "requests") and self.command == "POST":
@@ -243,6 +245,14 @@ class SailHandler(BaseHTTPRequestHandler):
             HTTPStatus.OK,
             self.server.runtime.history(status=status, tenant=options.get("tenant"), **_pagination(options)),
         )
+
+    def _terminal_stream(self, query: str) -> Reply:
+        options = _options(query, {"after", "limit", "wait_ms"})
+        wait = _natural(options.get("wait_ms", "0"), "wait_ms", maximum=10_000)
+        page = self.server.runtime.terminal_stream(
+            **_pagination(options), timeout=0 if wait == 0 else wait / 1000,
+        )
+        return Reply(HTTPStatus.OK, page.to_json())
 
     def _activate(self) -> Reply:
         body = fields(self._body(), ("model", "revision"), "activation", ("expected_generation",))

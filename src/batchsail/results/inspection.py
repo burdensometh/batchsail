@@ -12,6 +12,7 @@ from ..registry.model import InstalledModel, ModelKey
 from .model import Receipt, ResultStatus
 
 _ISSUE_LIMIT = 50
+_SCHEMA_VERSION = 2
 _SCAN_QUERY = """
 SELECT position, tenant, request_id, model, revision, status, fingerprint, envelope
 FROM receipts ORDER BY position
@@ -25,6 +26,7 @@ class ReceiptAudit:
     records: int = 0
     decoded: int = 0
     pending: int = 0
+    terminal_logged: int = 0
     unlinked: Counter[str] = field(default_factory=Counter)
     by_status: Counter[str] = field(default_factory=Counter)
     by_model: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
@@ -43,6 +45,7 @@ class ReceiptAudit:
             "records": self.records,
             "decoded": self.decoded,
             "pending": self.pending,
+            "terminal_logged": self.terminal_logged,
             "unlinked": dict(sorted(self.unlinked.items())),
             "by_status": dict(sorted(self.by_status.items())),
             "by_model": {
@@ -88,6 +91,52 @@ def _audit_row(
             audit.issue("output_spec_mismatch", str(exc), position=position)
 
 
+def _audit_terminal_log(connection: sqlite3.Connection, audit: ReceiptAudit) -> None:
+    tables = {
+        row[0]
+        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    if "terminal_log" not in tables:
+        audit.issue("terminal_log_missing", "durable terminal stream table is absent")
+        return
+    rows = connection.execute(
+        "SELECT seq, tenant, request_id FROM terminal_log ORDER BY seq",
+    ).fetchall()
+    audit.terminal_logged = len(rows)
+    for expected, (seq, _tenant, _request_id) in enumerate(rows, start=1):
+        if seq != expected:
+            audit.issue("terminal_log_gap", "terminal stream positions must be gap-free", position=seq)
+            break
+    mismatches = connection.execute(
+        """
+        SELECT COUNT(*) FROM terminal_log
+        JOIN receipts
+          ON receipts.tenant = terminal_log.tenant AND receipts.request_id = terminal_log.request_id
+        WHERE receipts.status = 'pending'
+        """,
+    ).fetchone()[0]
+    if mismatches:
+        audit.issue("terminal_log_pending", "terminal stream references a pending receipt")
+    unlinked = connection.execute(
+        """
+        SELECT COUNT(*) FROM terminal_log
+        LEFT JOIN receipts
+          ON receipts.tenant = terminal_log.tenant AND receipts.request_id = terminal_log.request_id
+        WHERE receipts.position IS NULL
+        """,
+    ).fetchone()[0]
+    if unlinked:
+        audit.issue("terminal_log_orphan", "terminal stream references a missing receipt")
+    terminal_rows = connection.execute(
+        "SELECT COUNT(*) FROM receipts WHERE status != 'pending'",
+    ).fetchone()[0]
+    if terminal_rows != len(rows):
+        audit.issue(
+            "terminal_log_drift",
+            f"terminal receipts ({terminal_rows}) do not match stream positions ({len(rows)})",
+        )
+
+
 def inspect_receipts(path: Path, models: dict[ModelKey, InstalledModel]) -> ReceiptAudit:
     audit = ReceiptAudit(path.exists())
     if not audit.present:
@@ -96,14 +145,18 @@ def inspect_receipts(path: Path, models: dict[ModelKey, InstalledModel]) -> Rece
     try:
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
         audit.sqlite_version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if audit.sqlite_version != 1:
-            audit.issue("unsupported_schema", f"expected SQLite user_version 1, got {audit.sqlite_version}")
+        if audit.sqlite_version != _SCHEMA_VERSION:
+            audit.issue(
+                "unsupported_schema",
+                f"expected SQLite user_version {_SCHEMA_VERSION}, got {audit.sqlite_version}",
+            )
             return audit
         for (result,) in connection.execute("PRAGMA quick_check(50)"):
             if result != "ok":
                 audit.issue("sqlite_integrity", result)
         for row in connection.execute(_SCAN_QUERY):
             _audit_row(audit, row, models)
+        _audit_terminal_log(connection, audit)
     except sqlite3.Error as exc:
         audit.issue("sqlite_error", str(exc))
     finally:

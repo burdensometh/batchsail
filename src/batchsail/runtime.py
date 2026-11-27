@@ -26,6 +26,7 @@ from .request import Admission, Request, RequestDeadline, RequestKey
 from .request.lifecycle import DeadlineIndex, Ticket
 from .results import Failure, ReceiptStore, ResultEnvelope, ResultStatus
 from .results.model import Receipt
+from .results.store import TerminalPage
 from .telemetry import Telemetry
 from .tensor import Tensor
 from .workspace import WorkspaceFormat
@@ -586,6 +587,35 @@ class Runtime:
             "results": [receipt.result.to_json() for _, receipt in page],
             "next": page[-1][0] if page else after,
         }
+
+    def terminal_stream(
+        self,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        timeout: float | None = None,
+    ) -> TerminalPage:
+        """Read durable terminal results strictly after ``after``.
+
+        The position is the settlement order persisted in the receipt database,
+        so a disconnected reader resumes without gaps even across an event
+        buffer overwrite or a process restart. When no new terminal result is
+        available the call waits up to ``timeout`` seconds; waiting readers are
+        woken by settlement but never hold up the coordinator's settle path.
+        """
+        integer(after, "after cursor")
+        integer(limit, "terminal limit", minimum=1, maximum=1000)
+        end = None if timeout is None else monotonic() + finite(timeout, "terminal wait timeout")
+        with self._condition:
+            while True:
+                self._require_open()
+                page = self._receipts.terminal_page(after=after, limit=limit)
+                if page.entries or timeout == 0:
+                    return page
+                remaining = None if end is None else end - monotonic()
+                if remaining is not None and remaining <= 0:
+                    return page
+                self._condition.wait(remaining)
 
     def drain(self, *, timeout: float) -> DrainResult:
         """Stop new admissions and give already accepted batches time to finish."""

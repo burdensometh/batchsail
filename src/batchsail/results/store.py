@@ -2,10 +2,11 @@
 
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sqlite3
 from threading import RLock
+from typing import Any
 
 from ..clock import NS_PER_MS
 from ..codec import decode, encode, identifier, integer
@@ -13,7 +14,7 @@ from ..errors import Conflict, ErrorCode, Invalid, SailError
 from ..request.model import RequestKey
 from .model import Failure, Receipt, ResultEnvelope, ResultStatus
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SCHEMA = """
 CREATE TABLE receipts (
     position INTEGER PRIMARY KEY,
@@ -27,8 +28,48 @@ CREATE TABLE receipts (
     UNIQUE (tenant, request_id)
 )
 """
+_TERMINAL_SCHEMA = """
+CREATE TABLE terminal_log (
+    seq INTEGER PRIMARY KEY,
+    tenant TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    UNIQUE (tenant, request_id)
+)
+"""
 _COLUMNS = "fingerprint, envelope"
 _UPDATE = "UPDATE receipts SET status=?, envelope=? WHERE tenant=? AND request_id=? AND status='pending'"
+# The durable resumable cursor: one gap-free position per terminal settlement,
+# assigned inside the same transaction that persists the terminal envelope.
+_APPEND_TERMINAL = """
+INSERT INTO terminal_log (seq, tenant, request_id)
+SELECT COALESCE(MAX(seq), 0) + 1, ?, ? FROM terminal_log
+"""
+_TERMINAL_PAGE = """
+SELECT terminal_log.seq, receipts.fingerprint, receipts.envelope
+FROM terminal_log JOIN receipts
+  ON receipts.tenant = terminal_log.tenant AND receipts.request_id = terminal_log.request_id
+WHERE terminal_log.seq > ?
+ORDER BY terminal_log.seq
+LIMIT ?
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class TerminalPage:
+    """One page of the durable terminal stream, ordered by settlement position."""
+
+    entries: tuple[tuple[int, ResultEnvelope], ...]
+    next: int
+    latest: int
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "results": [
+                {**result.to_json(), "terminal_position": seq} for seq, result in self.entries
+            ],
+            "next": self.next,
+            "latest": self.latest,
+        }
 
 
 class ReceiptStore:
@@ -49,11 +90,37 @@ class ReceiptStore:
                 self._db.execute(_SCHEMA)
                 self._db.execute("CREATE INDEX receipts_tenant_position ON receipts (tenant, position)")
                 self._db.execute("CREATE INDEX receipts_status_position ON receipts (status, position)")
-                self._db.execute("PRAGMA user_version = 1")
+                self._db.execute(_TERMINAL_SCHEMA)
+                self._db.execute("PRAGMA user_version = 2")
+            elif version == 1:
+                self._migrate_v1()
             elif version != _SCHEMA_VERSION:
                 raise Invalid(f"receipt database version {version} is unsupported")
         self._db.execute("PRAGMA journal_mode = WAL")
         self._db.execute("PRAGMA synchronous = FULL")
+
+    def _migrate_v1(self) -> None:
+        """Backfill the terminal log from receipts already persisted by v1.
+
+        Admission ``position`` is the only durable order available for rows
+        terminal before the upgrade; the two sequences agree for every row
+        settled by version two and later.
+        """
+        self._db.execute(_TERMINAL_SCHEMA)
+        self._db.execute(
+            """
+            INSERT INTO terminal_log (seq, tenant, request_id)
+            SELECT ROW_NUMBER() OVER (ORDER BY position), tenant, request_id
+            FROM receipts WHERE status != 'pending'
+            """,
+        )
+        self._db.execute("PRAGMA user_version = 2")
+
+    def _append_terminal(self, result: ResultEnvelope) -> None:
+        # The unique (tenant, request_id) constraint makes the append idempotent
+        # for a given admission; settlement only reaches here on the single
+        # pending-to-terminal transition, so each terminal result takes one seq.
+        self._db.execute(_APPEND_TERMINAL, (result.key.tenant, result.key.request_id))
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -157,6 +224,7 @@ class ReceiptStore:
                 raise Conflict("terminal result does not identify its admission and assignment")
             if not self._update_pending(result):
                 raise Conflict("pending result disappeared during settlement")
+            self._append_terminal(result)
             return result, True
 
     def recover(self, wall_ms: int) -> int:
@@ -177,6 +245,7 @@ class ReceiptStore:
                 )
                 if not self._update_pending(recovered):
                     raise RuntimeError("admission disappeared while recovering the result database")
+                self._append_terminal(recovered)
             return len(rows)
 
     def history(
@@ -214,8 +283,23 @@ class ReceiptStore:
                         raise Conflict(f"different receipt already exists for {receipt.result.key.request_id}")
                     continue
                 self._insert(receipt)
+                self._append_terminal(receipt.result)
                 written += 1
             return written
+
+    def terminal_latest(self) -> int:
+        with self._lock:
+            row = self._db.execute("SELECT MAX(seq) FROM terminal_log").fetchone()
+        return 0 if row is None or row[0] is None else row[0]
+
+    def terminal_page(self, *, after: int = 0, limit: int = 100) -> TerminalPage:
+        integer(after, "after cursor")
+        integer(limit, "terminal limit", minimum=1, maximum=1000)
+        with self._lock:
+            rows = self._db.execute(_TERMINAL_PAGE, (after, limit)).fetchall()
+            latest = self.terminal_latest()
+        entries = tuple((seq, self._record((fingerprint, payload)).result) for seq, fingerprint, payload in rows)
+        return TerminalPage(entries, entries[-1][0] if entries else after, latest)
 
     def close(self) -> None:
         with self._lock:
