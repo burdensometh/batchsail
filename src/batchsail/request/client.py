@@ -218,9 +218,12 @@ class HttpClient:
         if status is not None:
             query["status"] = status.value
         _, payload = self._send("GET", "/v1/requests?" + urlencode(query), (200,), replayable=True)
-        page = fields(payload, ("results", "next"), "history page")
+        page = fields(payload, ("results", "next"), "history page", ("attempts", "attempts_known"))
         if not isinstance(page["results"], list) or len(page["results"]) > limit:
             raise TransportFailure("server returned an invalid history page")
+        attempts = page.get("attempts")
+        if attempts is not None and (not isinstance(attempts, list) or len(attempts) != len(page["results"])):
+            raise TransportFailure("server returned inconsistent attempt evidence")
         receipts = tuple(ResultEnvelope.from_json(item) for item in page["results"])
         marker = integer(page["next"], "history next cursor", minimum=after)
         if bool(receipts) != (marker > after):

@@ -99,7 +99,7 @@ def _receipt_command(args: argparse.Namespace) -> int:
         store = ReceiptStore(workspace.root / "receipts.sqlite")
         try:
             if args.action == "query":
-                _display(store.result(RequestKey(args.tenant, args.request_id)).to_json())
+                _display(store.query(RequestKey(args.tenant, args.request_id)))
             elif args.action == "import":
                 _display({"imported": import_archive(store, args.archive)})
             else:

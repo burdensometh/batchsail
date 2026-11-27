@@ -335,7 +335,7 @@ class Runtime:
         self._sequence += 1
         ticket = Ticket(request, pin, deadline, self._sequence)
         result = ResultEnvelope(request.key, revision.key, ResultStatus.PENDING, self.clock.wall_ms())
-        self._receipts.insert(Receipt(fingerprint, result))
+        self._receipts.insert(Receipt.tracked(fingerprint, result))
         self._tickets[ticket.key] = ticket
         self._note("request_accepted", **request.key.to_json(), **revision.key.to_json())
         if deadline.expired(now_ns):
@@ -398,6 +398,7 @@ class Runtime:
         failure: Failure | None = None,
         output: Tensor | None = None,
     ) -> ResultEnvelope:
+        now_ns = self.clock.now_ns()
         current = self._receipts.result(ticket.key)
         if current.status.terminal:
             return current
@@ -405,7 +406,9 @@ class Runtime:
             current, status=status, failure=failure, output=output,
             elapsed_ns=max(current.queue_ns or 0, now_ns - ticket.deadline.accepted_ns),
         )
-        result, changed = self._receipts.settle(target, expected_attempt=ticket.attempt)
+        result, changed = self._receipts.settle(
+            target, expected_attempt=ticket.attempt, wall_ms=self.clock.wall_ms(),
+        )
         if not changed:
             raise RuntimeError("coordinator attempted to settle a stale live ticket")
         ticket.terminal = True
@@ -464,10 +467,13 @@ class Runtime:
         batch = Batch.from_tickets(f"batch-{self._batch_sequence}", plan.shape, plan.tickets)
         self._receipts.assign(
             (
-                slot.key, slot.attempt, batch.id, slot.index, plan.placement.device,
-                now_ns - ticket.deadline.accepted_ns,
-            )
-            for slot, ticket in zip(batch.slots, plan.tickets, strict=True)
+                (
+                    slot.key, slot.attempt, batch.id, slot.index, plan.placement.device,
+                    now_ns - ticket.deadline.accepted_ns,
+                )
+                for slot, ticket in zip(batch.slots, plan.tickets, strict=True)
+            ),
+            wall_ms=self.clock.wall_ms(),
         )
         self._queues.commit(plan.shape, plan.tickets)
         for ticket, slot in zip(plan.tickets, batch.slots, strict=True):
@@ -537,6 +543,11 @@ class Runtime:
         if failure is None:
             self._settle(ticket, ResultStatus.SUCCEEDED, now_ns, output=execution.outputs[index])
         elif self._can_retry(ticket, failure):
+            if not self._receipts.conclude_attempt(
+                ticket.key, ticket.attempt, ResultStatus.FAILED, failure,
+                wall_ms=self.clock.wall_ms(),
+            ):
+                raise RuntimeError("retry could not close the failed attempt")
             self._queues.add(ticket, now_ns)
             self._note(
                 "request_requeued", **ticket.key.to_json(), **batch.model.key.to_json(),
@@ -584,6 +595,7 @@ class Runtime:
             page = self._receipts.history(after=after, limit=limit, tenant=tenant, status=status)
         return {
             "results": [receipt.result.to_json() for _, receipt in page],
+            "attempts": [receipt.attempts_json() for _, receipt in page],
             "next": page[-1][0] if page else after,
         }
 

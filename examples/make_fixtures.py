@@ -6,12 +6,11 @@ from tempfile import TemporaryDirectory
 
 from batchsail.batcher import BatchingPolicy
 from batchsail.clock import ManualClock
-from batchsail.codec import decode
+from batchsail.codec import atomic_write, decode, encode
 from batchsail.config import RuntimeConfig
 from batchsail.registry.authoring import pack_definition
 from batchsail.request import Request
 from batchsail.results import ReceiptStore, ResultStatus
-from batchsail.results.archive import export_archive
 from batchsail.runtime import Runtime
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,8 +40,12 @@ def main() -> None:
                 raise RuntimeError(f"fixture inference failed: {result.to_json()}")
         store = ReceiptStore(workspace / "receipts.sqlite")
         try:
-            if export_archive(store, args.output / "receipts.v1.jsonl") != 1:
-                raise RuntimeError("fixture archive does not contain exactly one receipt")
+            # The checked-in archive is the historical version-one fixture. Emit
+            # it in its original shape so rebuilding the fixtures is byte-stable.
+            receipt = store.receipt(source.key)
+            archive = args.output / "receipts.v1.jsonl"
+            payload = encode(receipt.to_v1()) + b"\n"
+            atomic_write(archive, payload)
         finally:
             store.close()
 

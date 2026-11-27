@@ -1,6 +1,6 @@
-"""Client-facing terminal envelopes and the portable version-one receipt record."""
+"""Client-facing envelopes, attempted-work evidence, and portable receipt records."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -46,6 +46,114 @@ class Failure:
         except ValueError as exc:
             raise Invalid("unknown failure code") from exc
         return cls(code, obj["message"], obj["retryable"])
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptEvidence:
+    """One dispatch of a request and how that attempt physically ended.
+
+    ``outcome`` is null exactly while the attempt is still in flight. A
+    ``None`` attempt list on a receipt means no evidence was ever recorded;
+    ``attempts_known`` distinguishes complete history from a partially known
+    tail left behind by a version-one receipt.
+    """
+
+    attempt: int
+    batch_id: str
+    slot: int
+    device: str
+    queue_ns: int
+    dispatched_at_ms: int | None = None
+    outcome: ResultStatus | None = None
+    failure: Failure | None = None
+    finished_at_ms: int | None = None
+
+    def __post_init__(self) -> None:
+        integer(self.attempt, "attempt", minimum=1, maximum=8)
+        identifier(self.batch_id, "batch_id")
+        integer(self.slot, "slot index", maximum=63)
+        identifier(self.device, "device")
+        integer(self.queue_ns, "queue_ns")
+        if self.dispatched_at_ms is not None:
+            integer(self.dispatched_at_ms, "dispatched_at_ms")
+        if self.finished_at_ms is not None:
+            integer(self.finished_at_ms, "finished_at_ms")
+        if (
+            self.dispatched_at_ms is not None
+            and self.finished_at_ms is not None
+            and self.finished_at_ms < self.dispatched_at_ms
+        ):
+            raise Invalid("an attempt cannot finish before it was dispatched")
+        if self.outcome is not None and not isinstance(self.outcome, ResultStatus):
+            raise Invalid("attempt outcome must be a result status")
+        if self.outcome == ResultStatus.PENDING:
+            raise Invalid("an concluded attempt cannot be pending")
+        if self.outcome is None:
+            if self.failure is not None or self.finished_at_ms is not None:
+                raise Invalid("an unfinished attempt cannot have a failure or finish time")
+            return
+        if self.finished_at_ms is None:
+            raise Invalid("a concluded attempt must record when it finished")
+        if self.outcome == ResultStatus.SUCCEEDED:
+            if self.failure is not None:
+                raise Invalid("a successful attempt may not carry an error")
+        elif self.failure is None:
+            raise Invalid("a failed, cancelled or expired attempt must carry an error")
+        elif self.outcome == ResultStatus.CANCELLED and self.failure.code != ErrorCode.CANCELLED:
+            raise Invalid("cancelled attempts require a cancellation error")
+        elif self.outcome == ResultStatus.EXPIRED and self.failure.code != ErrorCode.DEADLINE:
+            raise Invalid("expired attempts require a deadline error")
+
+    @property
+    def concluded(self) -> bool:
+        return self.outcome is not None
+
+    def same_dispatch(self, other: "AttemptEvidence") -> bool:
+        """True when both describe the same physical dispatch."""
+        return (
+            self.attempt == other.attempt
+            and self.batch_id == other.batch_id
+            and self.slot == other.slot
+            and self.device == other.device
+            and self.queue_ns == other.queue_ns
+            and self.dispatched_at_ms == other.dispatched_at_ms
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "attempt": self.attempt,
+            "batch_id": self.batch_id,
+            "slot": self.slot,
+            "device": self.device,
+            "queue_ns": self.queue_ns,
+            "dispatched_at_ms": self.dispatched_at_ms,
+            "outcome": None if self.outcome is None else self.outcome.value,
+            "failure": None if self.failure is None else self.failure.to_json(),
+            "finished_at_ms": self.finished_at_ms,
+        }
+
+    @classmethod
+    def from_json(cls, value: Any) -> "AttemptEvidence":
+        item = fields(
+            value,
+            (
+                "attempt", "batch_id", "slot", "device", "queue_ns", "dispatched_at_ms",
+                "outcome", "failure", "finished_at_ms",
+            ),
+            "attempt evidence",
+        )
+        outcome = item["outcome"]
+        if outcome is not None:
+            try:
+                outcome = ResultStatus(outcome)
+            except ValueError as exc:
+                raise Invalid("unknown attempt outcome") from exc
+        return cls(
+            item["attempt"], item["batch_id"], item["slot"], item["device"], item["queue_ns"],
+            item["dispatched_at_ms"], outcome,
+            None if item["failure"] is None else Failure.from_json(item["failure"]),
+            item["finished_at_ms"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,14 +251,100 @@ class ResultEnvelope:
 
 @dataclass(frozen=True, slots=True)
 class Receipt:
+    """A request fingerprint, its observable result, and its attempt history.
+
+    Version one receipts are preserved byte-for-byte on export and carry no
+    attempt evidence. Version two receipts record every dispatch in
+    ``attempts``; an empty tuple means no attempt was ever assigned, while
+    ``None`` means the history is unknown (a legacy version one receipt).
+    """
+
     fingerprint: str
     result: ResultEnvelope
+    attempts: tuple[AttemptEvidence, ...] | None = None
+    version: int = 1
 
     def __post_init__(self) -> None:
         digest_text(self.fingerprint, "request fingerprint")
+        integer(self.version, "receipt version", minimum=1, maximum=2)
+        if self.version == 1:
+            if self.attempts is not None:
+                raise Invalid("a version one receipt has no attempt evidence")
+            return
+        if self.attempts is None:
+            raise Invalid("a version two receipt must state its attempt history")
+        expected = 1
+        for evidence in self.attempts:
+            if evidence.attempt != expected:
+                raise Invalid("attempt evidence must be numbered consecutively from one")
+            expected += 1
+        if self.result.attempt and self.result.attempt > len(self.attempts):
+            raise Invalid("the result names an attempt with no evidence")
+        if len(self.attempts) > 8:
+            raise Invalid("a receipt may record at most eight attempts")
+
+    @property
+    def attempts_known(self) -> bool:
+        return self.attempts is not None
+
+    @property
+    def final_attempt(self) -> AttemptEvidence | None:
+        return None if not self.attempts else self.attempts[-1]
+
+    @classmethod
+    def tracked(cls, fingerprint: str, result: ResultEnvelope) -> "Receipt":
+        """A new version-two receipt that will record attempts as they occur."""
+        return cls(fingerprint, result, (), 2)
+
+    def with_attempts(self, attempts: tuple[AttemptEvidence, ...]) -> "Receipt":
+        if self.version == 1:
+            return replace(self, attempts=attempts, version=2)
+        return replace(self, attempts=attempts)
+
+    def to_json(self) -> dict[str, Any]:
+        if self.version == 1:
+            return self.to_v1()
+        return {
+            "version": 2,
+            "fingerprint": self.fingerprint,
+            "result": self.result.to_json(),
+            "attempts": [evidence.to_json() for evidence in self.attempts or ()],
+        }
+
+    def attempts_json(self) -> list[dict[str, Any]] | None:
+        """Known attempts as JSON, or ``None`` when the history is unknown."""
+        if self.attempts is None:
+            return None
+        return [evidence.to_json() for evidence in self.attempts]
+
+    def query_json(self) -> dict[str, Any]:
+        """A receipt view that states explicitly whether attempts are known."""
+        document = self.to_json()
+        document["attempts_known"] = self.attempts_known
+        return document
 
     def to_v1(self) -> dict[str, Any]:
         return {"version": 1, "fingerprint": self.fingerprint, "result": self.result.to_json()}
+
+    @classmethod
+    def from_json(cls, value: Any) -> "Receipt":
+        if not isinstance(value, dict) or "version" not in value:
+            raise Invalid("receipt must be an object with a version")
+        version = value["version"]
+        if version == 1:
+            return cls.from_v1(value)
+        if version == 2:
+            document = fields(value, ("version", "fingerprint", "result", "attempts"), "receipt")
+            attempts = document["attempts"]
+            if not isinstance(attempts, list):
+                raise Invalid("receipt attempts must be an array")
+            return cls(
+                document["fingerprint"],
+                ResultEnvelope.from_json(document["result"]),
+                tuple(AttemptEvidence.from_json(item) for item in attempts),
+                2,
+            )
+        raise Invalid("receipt version must be 1 or 2")
 
     @classmethod
     def from_v1(cls, value: Any) -> "Receipt":

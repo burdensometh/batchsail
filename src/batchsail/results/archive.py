@@ -1,4 +1,10 @@
-"""Streaming v1 JSON Lines archives for offline transfer of terminal results."""
+"""Streaming JSON Lines archives for offline transfer of terminal results.
+
+Version-one receipts are exported exactly as they were imported, while newer
+receipts carry their attempt evidence. Import accepts both. Duplicate terminal
+receipts merge only the attempt evidence they can prove agrees; the request
+still has exactly one final result.
+"""
 
 from collections.abc import Iterator
 import os
@@ -20,7 +26,7 @@ def read_archive(path: Path) -> Iterator[Receipt]:
             if len(line) > MAX_LINE_BYTES:
                 raise Invalid(f"{path}:{index}: receipt exceeds {MAX_LINE_BYTES} bytes")
             try:
-                yield Receipt.from_v1(decode(line))
+                yield Receipt.from_json(decode(line))
             except Invalid as exc:
                 raise Invalid(f"{path}:{index}: {exc}") from exc
             index += 1
@@ -40,7 +46,7 @@ def export_archive(store: ReceiptStore, path: Path, *, tenant: str | None = None
             while page := store.history(after=cursor, limit=25, tenant=tenant):
                 for cursor, receipt in page:
                     if receipt.result.status.terminal:
-                        file.write(encode(receipt.to_v1()) + b"\n")
+                        file.write(encode(receipt.to_json()) + b"\n")
                         count += 1
             file.flush()
             os.fsync(file.fileno())
